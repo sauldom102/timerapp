@@ -1,0 +1,11 @@
+{
+  "name": "exampleapp",
+  "displayName": "Pomo",
+  "expo": {
+    "splash": {
+      "image": "./assets/img/splash.png",
+      "resizeMode": "cover",
+      "backgroundColor": "#FF575C"
+    }
+  }
+}

@@ -1,0 +1,244 @@
+name: CI/CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: Choose the environment to deploy to
+        options:
+          - staging
+          - production
+      os:
+        type: choice
+        description: Choose the OS to deploy to
+        options: 
+          - both
+          - ios
+          - android
+      version:
+        description: 'Version to deploy (1.0.0, 1.1.2, etc)'
+        required: true
+        type: string
+      build:
+        description: 'Build to deploy (1, 2, etc)'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  iosBuild:
+    name: iOS build
+    runs-on: macos-latest
+    if:  ${{ (github.event.inputs.os == 'both') || (github.event.inputs.os == 'ios') }}
+
+    steps:
+      - name: 'Prepare: checkout'
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: 'Prepare: create env file'
+        uses: ozaytsev86/create-env-file@v1
+        with:
+          ENV_ENVIRONMENT: ${{ github.event.inputs.environment == 'production' && 'PROD' ||  github.event.inputs.environment == 'staging' && 'DEV' }}
+
+      - name: 'Prepare: setup node'
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+          cache: 'yarn'
+
+      - name: 'Prepare: install dependencies'
+        run: yarn
+
+      - name: 'Prepare: set build version'
+        if: ${{ (github.event.inputs.version != '') && (github.event.inputs.build != '') }}
+        run: yarn bump ${{ github.event.inputs.version }} ${{ github.event.inputs.build }}
+
+      - name: 'Run: lint'
+        run: yarn lint
+
+      - name: 'Prepare: build cache'
+        uses: mikehardy/buildcache-action@v1
+
+      - name: 'Prepare: ruby'
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: 'Prepare: pods cache'
+        uses: actions/cache@v2
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+            ~/.cocoapods
+          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: 'Prepare: install pods'
+        working-directory: ios
+        run: pod install
+
+      - name: 'Run: build'
+        uses: yukiarrr/ios-build-action@v1.5.0
+        with:
+          project-path: ios/rnapp.xcodeproj
+          p12-base64: ${{ secrets.IOS_P12_BASE64 }}
+          mobileprovision-base64: ${{ secrets.IOS_MOBILE_PROVISION_BASE64 }}
+          code-signing-identity: 'iPhone Distribution'
+          team-id: ${{ secrets.IOS_TEAM_ID }}
+          certificate-password: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          workspace-path: ios/rnapp.xcworkspace
+          scheme: rnapp
+
+      - name: 'Run: upload artifact'
+        uses: actions/upload-artifact@v3
+        with:
+          name: iosbuild
+          path: output.ipa
+
+  androidBuild:
+    name: Android build
+    runs-on: ubuntu-latest
+    if:  ${{ (github.event.inputs.os == 'both') || (github.event.inputs.os == 'android') }}
+
+    steps:
+      - name: 'Prepare: checkout'
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: 'Prepare: create env file'
+        uses: ozaytsev86/create-env-file@v1
+        with:
+          ENV_ENVIRONMENT: ${{ github.event.inputs.environment == 'production' && 'PROD' ||  github.event.inputs.environment == 'staging' && 'DEV' }}
+          ENV_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ENV_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: 'Prepare: write signing config to gradle.properties'
+        run: |
+            echo "\n" >> android/gradle.properties
+            echo "STORE_FILE=prod.keystore" >> android/gradle.properties
+            echo "STORE_PASSWORD=$ANDROID_STORE_PASSWORD" >> android/gradle.properties
+            echo "KEY_ALIAS=$ANDROID_KEY_ALIAS" >> android/gradle.properties
+            echo "KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> android/gradle.properties
+        shell: bash
+        env:
+          ANDROID_STORE_PASSWORD: ${{secrets.ANDROID_STORE_PASSWORD}}
+          ANDROID_KEY_ALIAS: ${{secrets.ANDROID_KEY_ALIAS}}
+          ANDROID_KEY_PASSWORD: ${{secrets.ANDROID_KEY_PASSWORD}}
+
+      - name: 'Prepare: setup node'
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+          cache: 'yarn'
+
+      - name: 'Prepare: install dependencies'
+        run: yarn
+
+      - name: 'Prepare: set build version'
+        if: ${{ (github.event.inputs.version != '') && (github.event.inputs.build != '') }}
+        run: yarn bump ${{ github.event.inputs.version }} ${{ github.event.inputs.build }}
+
+      - name: 'Run: lint'
+        run: yarn lint
+
+      - name: 'Prepare: keystore'
+        run: |
+          echo "$ANDROID_KEYSTORE" > keystore.b64
+          base64 -d -i keystore.b64 > android/app/prod.keystore
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+
+      - name: 'Prepare: setup openjdk'
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+          cache: 'gradle'
+
+      - name: 'Run: build'
+        run: |
+          cd android && ./gradlew app:bundleRelease --no-daemon
+
+      - name: 'Run: upload artifact'
+        uses: actions/upload-artifact@v3
+        with:
+          name: androidbuild
+          path: android/app/build/outputs/bundle/release/app-release.aab
+
+  iosDeploy:
+    name: iOS deployment
+    runs-on: macos-latest
+    needs: [iosBuild]
+
+    steps:
+      - name: 'Prepare: download artifact'
+        uses: actions/download-artifact@v3
+        with:
+          name: iosbuild
+
+      - name: 'Run: deploy'
+        uses: apple-actions/upload-testflight-build@v1
+        with:
+          app-path: output.ipa
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+  androidDeploy:
+    name: Android deployment
+    runs-on: ubuntu-latest
+    needs: [androidBuild]
+
+    steps:
+      - name: 'Prepare: google api access'
+        run: |
+          echo "$GOOGLE_PLAY_API_ACCESS" > google_play_config.json.b64
+          base64 -d -i google_play_config.json.b64 > google_play_config.json
+        env:
+          GOOGLE_PLAY_API_ACCESS: ${{ secrets.GOOGLE_PLAY_API_ACCESS }}
+
+      - name: 'Prepare: download artifact'
+        uses: actions/download-artifact@v3
+        with:
+          name: androidbuild
+
+      - name: 'Run: deploy'
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: google_play_config.json
+          packageName: com.rnapp.app
+          releaseFiles: app-release.aab
+          track: internal
+          status: completed
+
+  post-deploy:
+    name: Post deployment
+    runs-on: ubuntu-latest
+    needs: [iosDeploy, androidDeploy]
+    if: always()
+
+    steps:
+      - name: Notify to Slack channel
+        uses: slackapi/slack-github-action@v1.19.0
+        with:
+          payload: |
+            {
+              "author": "${{ github.actor }}",
+              "ios_status": "${{ needs.iosDeploy.result }}",
+              "android_status": "${{ needs.androidDeploy.result }}",
+              "environment": "${{ github.event.inputs.environment }}",
+              "version": "${{ github.event.inputs.version }}",
+              "build": "${{ github.event.inputs.build }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
